@@ -1,3 +1,7 @@
+######### Simple Summarizing Chatbot #########
+
+
+import os
 import streamlit as st
 from langchain_huggingface import ChatHuggingFace, HuggingFaceEndpoint
 from langchain_core.messages import SystemMessage, HumanMessage, AIMessage
@@ -20,7 +24,7 @@ if "summary" not in st.session_state:
 if "chat_stopped" not in st.session_state:
     st.session_state.chat_stopped = False
 
-st.title("💬 Summarizing Chatbot (Streamlit)")
+st.title("Summarizing Chatbot")
 
 # Display chat history
 for msg in st.session_state.full_chat_history:
@@ -37,7 +41,7 @@ if not st.session_state.chat_stopped:
     if user_input:
         if user_input.lower() == "exit":
             st.session_state.chat_stopped = True
-            st.info("✅ Conversation stopped. Refresh the page to start again.")
+            st.info("Conversation stopped. Refresh the page to start again.")
         else:
             # Append new user message
             st.session_state.full_chat_history.append(HumanMessage(content=user_input))
@@ -70,5 +74,5 @@ else:
 
 # Optional: Show final summary at the bottom
 if st.session_state.summary != "The conversation so far is: None.":
-    with st.expander("🔎 Final conversation summary so far"):
+    with st.expander("Final conversation summary so far"):
         st.write(st.session_state.summary)
