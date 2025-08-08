@@ -1,126 +1,169 @@
-############### Summarizing Chatbot with RAG ###############
-
-
+############### Hybrid RAG Chatbot ###############
 
 import os
 import streamlit as st
+from dotenv import load_dotenv
 
-from langchain_huggingface import ChatHuggingFace, HuggingFaceEndpoint, HuggingFaceEmbeddings
+from langchain_community.embeddings import HuggingFaceEmbeddings
 from langchain_community.vectorstores import Chroma
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain_core.messages import SystemMessage, HumanMessage, AIMessage
 from langchain_core.prompts import PromptTemplate
-from dotenv import load_dotenv
-load_dotenv()
+from langchain_huggingface import ChatHuggingFace, HuggingFaceEndpoint
 
-# Step 1: Prepare documents
+load_dotenv()  # load HF_TOKEN, etc.
 
-transcript_text = """
-DeepMind is a British artificial intelligence research lab. They have made breakthroughs in deep reinforcement learning, protein folding, and more. Demis Hassabis is the co-founder and CEO.
-The lab focuses on solving general intelligence problems and has created systems like AlphaGo, AlphaFold, and others.
-"""
-
-# Split into chunks
-splitter = RecursiveCharacterTextSplitter(chunk_size=500, chunk_overlap=100)
-chunks = splitter.create_documents([transcript_text])
-
-# Create embeddings
-embeddings = HuggingFaceEmbeddings(model="sentence-transformers/all-MiniLM-L6-v2")
-
-# Create Chroma vector store
-vector_store = Chroma.from_documents(chunks, embeddings)
-
-# Create retriever
-retriever = vector_store.as_retriever(search_type="similarity", search_kwargs={"k": 3})
-
-# Step 2: Initialize LLM
-
+# ──────────────────────────────────────────────────────────────────────────────
+# LLM and embedding models
+# ──────────────────────────────────────────────────────────────────────────────
 llm_endpoint = HuggingFaceEndpoint(
     repo_id="deepseek-ai/DeepSeek-R1-0528",
     task="text-generation"
 )
 model = ChatHuggingFace(llm=llm_endpoint)
 
-# Step 3: Session state
+embeddings = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
 
+# ──────────────────────────────────────────────────────────────────────────────
+# Streamlit session-state
+# ──────────────────────────────────────────────────────────────────────────────
 if "full_chat_history" not in st.session_state:
     st.session_state.full_chat_history = []
-if "summary" not in st.session_state:
-    st.session_state.summary = "The conversation so far is: None."
 if "chat_stopped" not in st.session_state:
     st.session_state.chat_stopped = False
 
-st.title("RAG Chatbot")
+st.title("Hybrid RAG Chatbot (first 3 answers = LLM knowledge)")
 
-# Display chat history
+# ──────────────────────────────────────────────────────────────────────────────
+# Display prior messages
+# ──────────────────────────────────────────────────────────────────────────────
 for msg in st.session_state.full_chat_history:
-    if isinstance(msg, HumanMessage):
-        with st.chat_message("user"):
-            st.write(msg.content)
-    elif isinstance(msg, AIMessage):
-        with st.chat_message("assistant"):
-            st.write(msg.content)
+    role = "user" if isinstance(msg, HumanMessage) else "assistant"
+    with st.chat_message(role):
+        st.write(msg.content)
 
-# Step 4: User input & RAG logic
+# ──────────────────────────────────────────────────────────────────────────────
+# helper: build vector store from *pairs* of User+Assistant turns
+# ──────────────────────────────────────────────────────────────────────────────
+def build_retriever(history_pairs):
+    """Builds a retriever from Q-A pairs using optimized settings."""
+    if not history_pairs:
+        return None
 
+    splitter = RecursiveCharacterTextSplitter(
+        chunk_size=400,
+        chunk_overlap=50
+    )
+
+    docs = [
+        chunk.strip()
+        for pair in history_pairs
+        for chunk in splitter.split_text(pair)
+        if chunk.strip()
+    ]
+
+    if not docs:
+        return None
+
+    vectordb = Chroma.from_texts(docs, embeddings)
+
+    # Use MMR-based retriever for better relevance + diversity
+    retriever = vectordb.as_retriever(
+        search_type="mmr",
+        search_kwargs={
+            "k": 5,
+            "lambda_mult": 0.5
+        }
+    )
+    return retriever
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Main chat loop
+# ──────────────────────────────────────────────────────────────────────────────
 if not st.session_state.chat_stopped:
-    user_input = st.chat_input("Type your message here (type 'exit' to stop)...")
+    user_input = st.chat_input("Type your message ('exit' to stop)…")
+
     if user_input:
         if user_input.lower() == "exit":
             st.session_state.chat_stopped = True
             st.info("Conversation stopped. Refresh to start again.")
         else:
-            # Append user message
+            # Add user message to history
             st.session_state.full_chat_history.append(HumanMessage(content=user_input))
 
-            # Summarize conversation so far
-            summarize_msgs = [
-                SystemMessage(content="You are a summarization bot. Summarize the following conversation briefly."),
-                *st.session_state.full_chat_history
-            ]
-            summary_result = model.invoke(summarize_msgs)
-            st.session_state.summary = summary_result.content
+            # Count complete Q→A pairs
+            total_msgs = len(st.session_state.full_chat_history)
+            completed_pairs = total_msgs // 2
 
-            # Retrieve context from vector store
-            retrieved_docs = retriever.invoke(user_input)
-            context_text = "\n\n".join(doc.page_content for doc in retrieved_docs)
+            use_rag = completed_pairs >= 3
 
-            # Prepare final prompt
-            rag_prompt = PromptTemplate(
-                template="""
-                You are a helpful assistant.
-                Answer ONLY using the below context. If insufficient, say "I don't know."
+            # ------------------------------------------------------------------
+            # build retriever *only* when RAG should be active
+            # ------------------------------------------------------------------
+            if use_rag:
+                
+                pairs = []
+                msgs = st.session_state.full_chat_history[:-1]
+                i = 0
+                while i < len(msgs) - 1:
+                    if isinstance(msgs[i], HumanMessage) and isinstance(msgs[i+1], AIMessage):
+                        pair_text = f"User: {msgs[i].content}\nAssistant: {msgs[i+1].content}"
+                        pairs.append(pair_text)
+                        i += 2
+                    else:
+                        i += 1
 
-                Context:
-                {context}
+                retriever = build_retriever(pairs)
 
-                Question: {question}
-                """,
-                input_variables=['context', 'question']
-            )
+                # Retrieve context
+                context_text = ""
+                if retriever:
+                    retrieved = retriever.invoke(user_input)
+                    context_text = "\n\n".join(
+                        doc.page_content.strip()
+                        for doc in retrieved
+                        if doc.page_content.strip()
+                    )
 
-            final_prompt_text = rag_prompt.invoke({"context": context_text, "question": user_input}).to_string()
+                # Fallback if no context retrieved
+                if not context_text.strip():
+                    st.warning("No relevant past context found. Answering: I don't know.")
+                    st.session_state.full_chat_history.append(AIMessage(content="I don't know."))
+                    st.rerun()
 
-            # Compose messages for actual reply
-            messages_for_reply = [
-                SystemMessage(content="You are a helpful AI assistant."),
-                SystemMessage(content=f"Summary of previous conversation: {st.session_state.summary}"),
-                HumanMessage(content=final_prompt_text)
-            ]
+                # Strict-RAG prompt
+                rag_prompt = PromptTemplate(
+                    template="""
+You are a helpful assistant.
+Answer ONLY using the context below. If the context is insufficient, respond with: "I don't know."
 
-            # Get reply
-            reply = model.invoke(messages_for_reply)
+Context:
+{context}
 
-            # Append AI reply
+Question: {question}
+""",
+                    input_variables=["context", "question"]
+                )
+                final_prompt = rag_prompt.invoke(
+                    {"context": context_text, "question": user_input}
+                ).to_string()
+
+                messages_for_llm = [
+                    SystemMessage(content="You are a helpful assistant."),
+                    HumanMessage(content=final_prompt)
+                ]
+            else:
+                # Free-knowledge mode
+                messages_for_llm = [
+                    SystemMessage(content="You are a helpful assistant."),
+                    HumanMessage(content=user_input)
+                ]
+
+            # Get assistant reply
+            reply = model.invoke(messages_for_llm)
+
+            # Save assistant reply
             st.session_state.full_chat_history.append(AIMessage(content=reply.content))
-
-            # Rerun to display new messages
             st.rerun()
 else:
     st.info("Conversation stopped. Refresh to start again.")
-
-# Step 5: Show summary at bottom
-
-if st.session_state.summary != "The conversation so far is: None.":
-    with st.expander("Final conversation summary so far"):
-        st.write(st.session_state.summary)
